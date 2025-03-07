@@ -10,6 +10,7 @@
 
 import av
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torchvision
 import torchvision.transforms.functional as F
@@ -34,7 +35,7 @@ from pytorch3d.renderer import (
 )
 from pytorch3d.structures import Meshes
 
-TRUNCATE = 1
+TRUNCATE = 15
 
 
 def load_video(video_path: str) -> torch.Tensor:
@@ -46,12 +47,20 @@ def load_video(video_path: str) -> torch.Tensor:
 
     total_frames = container.streams.video[0].frames
     i = 0
+    c = 0
+    SKIP = 5
     for frame in tqdm(container.decode(video=0), total=total_frames):
+        i += 1
+
+        if i % SKIP != 0:
+            continue
+
+        c += 1
+
         img = pil_to_tensor(frame.to_image())
         frames.append(img)
 
-        i += 1
-        if TRUNCATE and i >= TRUNCATE:
+        if TRUNCATE and c >= TRUNCATE:
             break
 
     return torch.stack(frames).permute([0, 1, 3, 2])
@@ -69,12 +78,14 @@ def train(video_path: str, res=256):
     images = images / 256
     images = images.to(device)
 
+    sigma = 1e-4
     raster_settings = RasterizationSettings(
         image_size=res,
-        blur_radius=0.0,
-        faces_per_pixel=1,
+        blur_radius=np.log(1.0 / 1e-4 - 1.0) * sigma,
+        faces_per_pixel=3,
     )
 
+    N = images.shape[0]
     with torch.device(device):
         num_tris = 500_000
         # Sample center points in a shell between radius .3 and 1.5
@@ -83,52 +94,35 @@ def train(video_path: str, res=256):
         mesh_centers = torch.randn((3, num_tris))
         mesh_rs = torch.sum(mesh_centers**2, dim=0) ** 0.5
         target_rs = mesh_rs * (1.5 - 0.3) + 0.3
-        scale_rs = mesh_rs / target_rs
+        scale_rs = target_rs / mesh_rs
         mesh_centers *= scale_rs
-        triangle_offsets = torch.randn((3, 3, num_tris)) * 0.01  # (V, D, N)
+        triangle_offsets = torch.randn((3, 3, num_tris)) * 0.01  # (V, D, T)
         triangle_vertices = triangle_offsets + mesh_centers
-        triangle_vertices = torch.permute(triangle_vertices, [2, 0, 1])  # to (N, V, D)
-        triangle_vertices = triangle_vertices.reshape(-1, 3)
-        indices = torch.arange(triangle_vertices.shape[0]).view(-1, 3)  # (N, 3)
-        print(triangle_vertices.shape)
-        print(indices.shape)
+        triangle_vertices = torch.permute(triangle_vertices, [2, 0, 1])  # to (T, V, D)
+        triangle_vertices = triangle_vertices.reshape(-1, 3)[None]  # to (N, V, D)
+        triangle_vertices = triangle_vertices.repeat(N, 1, 1)
         triangle_vertices.requires_grad = True
+        indices = torch.arange(triangle_vertices.shape[1]).view(-1, 3)[
+            None
+        ]  # (N, F, 3)
+        indices = indices.repeat(N, 1, 1)
 
         vert_colors = torch.rand(triangle_vertices.shape)
-        # vert_colors = torch.ones(triangle_vertices.shape)
-        # vert_colors = vert_colors * 0.5
         vert_colors.requires_grad = True
+        textures = TexturesVertex(verts_features=vert_colors)
 
-        # Overfitting test:
-        triangle_vertices = torch.tensor(
-            [
-                [-0.5, -0.5, 1],
-                [0.5, -0.5, 1],
-                [0, 1, 1],
-            ],
-            requires_grad=True,
-        )  # (3, 3)
-        vert_colors = torch.zeros((3, 3))  # (3, 3)
-        vert_colors.requires_grad = True
-        indices = torch.tensor([[0, 1, 2]])  # (1, 3)
+        mesh = Meshes(
+            verts=triangle_vertices,
+            faces=indices,
+            textures=textures,
+        )
 
-        e_vert_colors = vert_colors[None].repeat(TRUNCATE, 1, 1)
-        e_tris = triangle_vertices[None].repeat(TRUNCATE, 1, 1)
-        e_indices = indices[None].repeat(TRUNCATE, 1, 1)
-        textures = TexturesVertex(verts_features=e_vert_colors)
-
-        meshes = Meshes(verts=e_tris, faces=e_indices, textures=textures)
-
-        N = images.shape[0]
-        # camera_rotations = look_at_rotation(
-        #     torch.zeros(N, 3), at=torch.randn((N, 3)), device=device
-        # )
         camera_rotations = look_at_rotation(
-            torch.tensor([[0, 0, 0.0]]), at=torch.tensor([[0, 0, 1.0]]), device=device
+            torch.zeros(N, 3), at=torch.randn((N, 3)), device=device
         )
         camera_rotations.requires_grad = True
-        # camera_translations = torch.randn((N, 3), device=device, requires_grad=True)
-        camera_translations = torch.zeros((N, 3), device=device, requires_grad=True)
+        camera_translations = torch.randn((N, 3), device=device) * 0.1
+        camera_translations.requires_grad = True
 
         cameras = FoVPerspectiveCameras(
             znear=0.003,
@@ -143,7 +137,7 @@ def train(video_path: str, res=256):
         lights = AmbientLights(device=device)
 
         rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
-        shader = HardPhongShader(device=device, cameras=cameras, lights=lights)
+        shader = SoftPhongShader(device=device, cameras=cameras, lights=lights)
         renderer = MeshRenderer(
             rasterizer=rasterizer,
             shader=shader,
@@ -153,22 +147,28 @@ def train(video_path: str, res=256):
             [
                 # *cameras.parameters(),
                 # *lights.parameters(),
-                # triangle_vertices,
-                vert_colors,
+                {"params": triangle_vertices, "lr": 0.00001},
+                {"params": vert_colors, "lr": 0.005},
             ],
-            lr=0.01,
+            lr=0.001,
         )
 
     # TODO: Mini-batch cameras and images
-    torchvision.utils.save_image(images[0], f"out_dir/target.png")
+    for n in range(15):
+        torchvision.utils.save_image(images[n], f"out_dir/target_{n}.png")
+
     for i in tqdm(range(1_000)):
         opt.zero_grad()
 
-        e_vert_colors = vert_colors[None].repeat(TRUNCATE, 1, 1)
-        textures = TexturesVertex(verts_features=e_vert_colors)
-        meshes = Meshes(verts=e_tris, faces=e_indices, textures=textures)
+        # TODO: This copy is maybe wasteful, but I get view of view errors without it.
+        textures = TexturesVertex(verts_features=vert_colors)
+        mesh = Meshes(
+            verts=triangle_vertices,
+            faces=indices,
+            textures=textures,
+        )
 
-        rendered = renderer(meshes)
+        rendered = renderer(mesh)
         rendered = rendered.permute([0, 3, 1, 2])  # (N, H, W, C) to (N, C, H, W)
         rendered = rendered[:, :3]
 
@@ -177,10 +177,14 @@ def train(video_path: str, res=256):
 
         if i % 20 == 0:
             print(f"Step: {i}, Loss: {loss.item()}")
-            print(f"Vertex colors: {vert_colors}")
+            print(
+                f"Average vertex distance: {torch.mean(torch.sum(triangle_vertices[0] ** 2, dim=1) ** .5)}\n"
+                f"Min vertex distance: {torch.min(torch.sum(triangle_vertices[0] ** 2, dim=1) ** .5)}"
+            )
 
         if i % 100 == 0:
-            torchvision.utils.save_image(rendered[0], f"out_dir/{i}.png")
+            for n in range(15):
+                torchvision.utils.save_image(rendered[n], f"out_dir/{i}_{n}.png")
 
         opt.step()
 
