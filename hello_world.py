@@ -11,6 +11,7 @@
 import av
 import matplotlib.pyplot as plt
 import torch
+import torchvision
 import torchvision.transforms.functional as F
 from torch.nn.parameter import Parameter
 from torch.optim import Adam
@@ -21,6 +22,7 @@ from pytorch3d.renderer import (
     AmbientLights,
     DirectionalLights,
     FoVPerspectiveCameras,
+    HardPhongShader,
     Materials,
     MeshRasterizer,
     MeshRenderer,
@@ -32,7 +34,7 @@ from pytorch3d.renderer import (
 )
 from pytorch3d.structures import Meshes
 
-TRUNCATE = 40
+TRUNCATE = 1
 
 
 def load_video(video_path: str) -> torch.Tensor:
@@ -52,7 +54,7 @@ def load_video(video_path: str) -> torch.Tensor:
         if TRUNCATE and i >= TRUNCATE:
             break
 
-    return torch.stack(frames)
+    return torch.stack(frames).permute([0, 1, 3, 2])
 
 
 # TODO:
@@ -64,6 +66,7 @@ def train(video_path: str, res=256):
     images = load_video(video_path)
     images = F.center_crop(images, min(images.shape[2], images.shape[3]))
     images = F.resize(images, (res, res))
+    images = images / 256
     images = images.to(device)
 
     raster_settings = RasterizationSettings(
@@ -90,24 +93,43 @@ def train(video_path: str, res=256):
         print(triangle_vertices.shape)
         print(indices.shape)
         triangle_vertices.requires_grad = True
-        mesh = Meshes(verts=[triangle_vertices], faces=[indices])
-        e_tris = triangle_vertices[None].expand(40, -1, -1)
-        e_indices = indices[None].expand(40, -1, -1)
-        print(e_tris.shape)
 
-        vert_colors = torch.ones(triangle_vertices.shape, requires_grad=True) * 0.5
-        e_vert_colors = vert_colors[None].expand(40, -1, -1)
+        vert_colors = torch.rand(triangle_vertices.shape)
+        # vert_colors = torch.ones(triangle_vertices.shape)
+        # vert_colors = vert_colors * 0.5
+        vert_colors.requires_grad = True
+
+        # Overfitting test:
+        triangle_vertices = torch.tensor(
+            [
+                [-0.5, -0.5, 1],
+                [0.5, -0.5, 1],
+                [0, 1, 1],
+            ],
+            requires_grad=True,
+        )  # (3, 3)
+        vert_colors = torch.zeros((3, 3))  # (3, 3)
+        vert_colors.requires_grad = True
+        indices = torch.tensor([[0, 1, 2]])  # (1, 3)
+
+        e_vert_colors = vert_colors[None].repeat(TRUNCATE, 1, 1)
+        e_tris = triangle_vertices[None].repeat(TRUNCATE, 1, 1)
+        e_indices = indices[None].repeat(TRUNCATE, 1, 1)
         textures = TexturesVertex(verts_features=e_vert_colors)
 
         meshes = Meshes(verts=e_tris, faces=e_indices, textures=textures)
-        # TODO: Generate initial mesh vertex colors?
 
         N = images.shape[0]
+        # camera_rotations = look_at_rotation(
+        #     torch.zeros(N, 3), at=torch.randn((N, 3)), device=device
+        # )
         camera_rotations = look_at_rotation(
-            torch.zeros(N, 3), at=torch.randn((N, 3)), device=device
+            torch.tensor([[0, 0, 0.0]]), at=torch.tensor([[0, 0, 1.0]]), device=device
         )
         camera_rotations.requires_grad = True
-        camera_translations = torch.randn((N, 3), device=device, requires_grad=True)
+        # camera_translations = torch.randn((N, 3), device=device, requires_grad=True)
+        camera_translations = torch.zeros((N, 3), device=device, requires_grad=True)
+
         cameras = FoVPerspectiveCameras(
             znear=0.003,
             zfar=20,
@@ -121,30 +143,49 @@ def train(video_path: str, res=256):
         lights = AmbientLights(device=device)
 
         rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
-        shader = SoftPhongShader(device=device, cameras=cameras, lights=lights)
+        shader = HardPhongShader(device=device, cameras=cameras, lights=lights)
         renderer = MeshRenderer(
             rasterizer=rasterizer,
             shader=shader,
         )
 
-        opt = Adam([*cameras.parameters(), *lights.parameters(), triangle_vertices])
+        opt = Adam(
+            [
+                # *cameras.parameters(),
+                # *lights.parameters(),
+                # triangle_vertices,
+                vert_colors,
+            ],
+            lr=0.01,
+        )
 
     # TODO: Mini-batch cameras and images
-    for i in tqdm(range(1000)):
+    torchvision.utils.save_image(images[0], f"out_dir/target.png")
+    for i in tqdm(range(1_000)):
         opt.zero_grad()
+
+        e_vert_colors = vert_colors[None].repeat(TRUNCATE, 1, 1)
+        textures = TexturesVertex(verts_features=e_vert_colors)
+        meshes = Meshes(verts=e_tris, faces=e_indices, textures=textures)
 
         rendered = renderer(meshes)
         rendered = rendered.permute([0, 3, 1, 2])  # (N, H, W, C) to (N, C, H, W)
         rendered = rendered[:, :3]
 
-        print(rendered.shape, images.shape)
         loss = torch.mean((rendered - images) ** 2)
         loss.backward()
-        print(i, loss)
+
+        if i % 20 == 0:
+            print(f"Step: {i}, Loss: {loss.item()}")
+            print(f"Vertex colors: {vert_colors}")
+
+        if i % 100 == 0:
+            torchvision.utils.save_image(rendered[0], f"out_dir/{i}.png")
 
         opt.step()
 
 
 if __name__ == "__main__":
+    torch.manual_seed(12)
     video_path = "office.mp4"
     train(video_path)
