@@ -1,0 +1,24 @@
+[project]
+name = "3d-reconstruction"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "William Henning",email = "Henningw@umich.edu"}
+]
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "av (>=14.2.0,<15.0.0)",
+    "matplotlib (>=3.10.1,<4.0.0)",
+    "tqdm (>=4.67.1,<5.0.0)",
+    "torch (>=2.6.0,<3.0.0)",
+    "poetry (>=2.1.1,<3.0.0)",
+    "pipx (>=1.7.1,<2.0.0)",
+    "pytorch3d @ git+https://github.com/kenshi84/pytorch3d.git",
+    "torchvision (>=0.21.0,<0.22.0)",
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
